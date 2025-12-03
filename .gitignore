@@ -50,6 +50,8 @@ Thumbs.db
 output/
 temp/
 tmp/
-/*/
+materialViewer/
 
+# Internal reference material
+*_internal*
 
