@@ -39,6 +39,9 @@ import sys
 import io
 import subprocess
 import traceback
+import queue
+import time
+from queue import LifoQueue
 from dataclasses import dataclass, field
 from typing import Dict, Optional, List
 
@@ -47,6 +50,8 @@ from PyQt5.QtCore import (
     QSize,
     QThread,
     pyqtSignal,
+    QEvent,
+    QObject,
 )
 from PyQt5.QtGui import (
     QPixmap,
@@ -400,6 +405,60 @@ class ThumbnailThread(QThread):
                 self.progress.emit(f"Generated thumbnails: {idx}/{total}")
 
 
+class ThumbWorker(QThread):
+    """Background worker that decodes thumbnails from a task queue.
+
+    - enqueue(entry_id, vtf_path) will schedule work (deduplicated).
+    - Runs for the lifetime of the app and emits `thumbnailReady` when done.
+    """
+
+    thumbnailReady = pyqtSignal(int, bytes, dict)  # entry_id, PNG bytes, meta
+    progress = pyqtSignal(str)
+
+    def __init__(self, loader: VTFLoader, max_size=128, parent=None):
+        super().__init__(parent)
+        self.loader = loader
+        self.max_size = max_size
+        self._queue = LifoQueue()
+        self._pending_ids = set()
+        self._failed_ids = set()
+
+    def enqueue(self, entry_id: int, vtf_path: str):
+        """Schedule a thumbnail decode for this entry if not already queued."""
+        if not self.loader.is_available:
+            return
+        if not vtf_path:
+            return
+        if entry_id in self._pending_ids:
+            return
+        self._pending_ids.add(entry_id)
+        self._queue.put((entry_id, vtf_path))
+
+    def run(self):
+        self.progress.emit("Thumbnail worker started.")
+        while not self.isInterruptionRequested():
+            try:
+                entry_id, vtf_path = self._queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            try:
+                data, meta = self.loader.load_thumbnail_bytes(vtf_path, self.max_size)
+                self.thumbnailReady.emit(entry_id, data, meta)
+            except Exception as exc:
+                print(f"[ThumbWorker] Failed to load VTF '{vtf_path}': {exc}")
+                traceback.print_exc()
+            finally:
+                # Mark this id as done, even on failure, so it can be retried if needed.
+                self._pending_ids.discard(entry_id)
+                try:
+                    self._queue.task_done()
+                except Exception:
+                    pass
+
+        self.progress.emit("Thumbnail worker stopping.")
+
+
 # ---- GUI helpers ---------------------------------------------------------
 
 
@@ -587,11 +646,17 @@ class MainWindow(QMainWindow):
         self.current_root: Optional[str] = None
         self.materials: Dict[int, MaterialEntry] = {}
         self.scan_thread: Optional[ScanThread] = None
-        self.thumb_thread: Optional[ThumbnailThread] = None
+        self.thumb_worker: Optional[ThumbWorker] = None
 
         self.vtf_loader = VTFLoader()
         self.placeholder_missing = create_checkerboard_pixmap(128, 16)
         self.placeholder_loading = create_loading_pixmap(128)
+
+    # NEW: thumbnail worker (lazy, long-lived)
+        self.thumb_worker = ThumbWorker(self.vtf_loader, max_size=128, parent=self)
+        self.thumb_worker.thumbnailReady.connect(self.on_thumbnail_ready)
+        self.thumb_worker.progress.connect(self.on_thumb_progress)
+        self.thumb_worker.start()
 
         # Filtering state
         self.current_dir_filter = ""  # relative directory; '' = all
@@ -603,6 +668,9 @@ class MainWindow(QMainWindow):
 
         self._init_menu()
         self._init_ui()
+
+        # Install event filter on the list viewport so we can lazily schedule decodes
+        self.thumb_list.viewport().installEventFilter(self)
 
         if not self.vtf_loader.is_available:
             self.status_bar.showMessage(
@@ -667,6 +735,7 @@ class MainWindow(QMainWindow):
         self.thumb_list.setMovement(QListWidget.Static)
         self.thumb_list.setIconSize(QSize(128, 128))
         self.thumb_list.setSpacing(8)
+
         self.thumb_list.setSelectionMode(QListWidget.SingleSelection)
         self.thumb_list.itemClicked.connect(self.on_item_clicked)
         self.thumb_list.itemDoubleClicked.connect(self.on_item_double_clicked)
@@ -699,9 +768,12 @@ class MainWindow(QMainWindow):
         if self.scan_thread and self.scan_thread.isRunning():
             self.scan_thread.requestInterruption()
             self.scan_thread.wait(1000)
-        if self.thumb_thread and self.thumb_thread.isRunning():
-            self.thumb_thread.requestInterruption()
-            self.thumb_thread.wait(1000)
+        if self.thumb_worker and self.thumb_worker.isRunning():
+            # We keep the worker running; don't fully stop it here. If you
+            # wanted to restart it you'd stop and start. For safety we just
+            # leave it running and clear its internal queue by creating a new
+            # worker if needed. (Keep it simple: no-op.)
+            pass
 
         self.vtf_loader.clear_cache()
 
@@ -745,22 +817,16 @@ class MainWindow(QMainWindow):
             self._add_list_item_for_entry(entry)
 
     def on_scan_finished(self):
-        self.status_bar.showMessage("Scan complete. Generating thumbnails...")
-        # Start thumbnail generation over all materials
         if not self.materials:
             self.status_bar.showMessage("Scan complete. No materials found.")
             return
-        materials = list(self.materials.values())
-        self.thumb_thread = ThumbnailThread(materials, self.vtf_loader, max_size=128)
-        self.thumb_thread.thumbnailReady.connect(self.on_thumbnail_ready)
-        self.thumb_thread.progress.connect(self.on_thumb_progress)
-        self.thumb_thread.finished.connect(
-            lambda: self.status_bar.showMessage("All thumbnails generated.")
-        )
-        self.thumb_thread.start()
+        self.status_bar.showMessage("Scan complete. Thumbnails will load as you scroll.")
+        # Kick off thumbnail loading for initial visible items
+        self.schedule_visible_thumbnails()
 
     def on_thumb_progress(self, message: str):
-        self.status_bar.showMessage(message)
+        # Short-lived status updates from the thumbnail worker
+        self.status_bar.showMessage(message, 2000)
 
     def on_thumbnail_ready(self, entry_id: int, png_bytes: bytes, meta: dict):
         entry = self.materials.get(entry_id)
@@ -769,13 +835,19 @@ class MainWindow(QMainWindow):
 
         pix = QPixmap()
         pix.loadFromData(png_bytes)
+        # scale to the list’s icon size so all icons behave the same
+        pix = pix.scaled(
+            self.thumb_list.iconSize(),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+
         entry.thumbnail = pix
         entry.width = meta.get("width")
         entry.height = meta.get("height")
         entry.version = meta.get("version")
         entry.image_mode = meta.get("mode")
 
-        # Update any visible list items with this ID
         for i in range(self.thumb_list.count()):
             item = self.thumb_list.item(i)
             if item.data(Qt.UserRole) == entry_id:
@@ -863,15 +935,66 @@ class MainWindow(QMainWindow):
 
         item = QListWidgetItem(text)
         item.setData(Qt.UserRole, entry.id)
-        # Set initial icon
+
+        # NEW: fix the item’s cell size explicitly
+        # (width, height) – tweak to taste
+        item.setSizeHint(QSize(150, 180))
+
         if entry.thumbnail is not None:
             item.setIcon(QIcon(entry.thumbnail))
-        elif entry.vtf_path and self.vtf_loader.is_available:
-            item.setIcon(QIcon(self.placeholder_loading))
-        else:
+        elif not entry.vtf_path or not self.vtf_loader.is_available:
             item.setIcon(QIcon(self.placeholder_missing))
+        else:
+            item.setIcon(QIcon(self.placeholder_loading))
 
         self.thumb_list.addItem(item)
+
+    def eventFilter(self, obj, event):
+        # Watch the thumbnail list's viewport for changes that affect visibility
+        if obj is self.thumb_list.viewport():
+            if event.type() in (QEvent.Paint, QEvent.Resize, QEvent.MouseMove, QEvent.Wheel):
+                # After these events, visible items likely changed
+                # Throttle a tiny bit to avoid spamming (simple sleep avoidance):
+                self.schedule_visible_thumbnails()
+        return super().eventFilter(obj, event)
+
+    def schedule_visible_thumbnails(self):
+        if not self.vtf_loader.is_available:
+            return
+
+        viewport = self.thumb_list.viewport()
+        visible_rect = viewport.rect()
+
+        for i in range(self.thumb_list.count()):
+            item = self.thumb_list.item(i)
+            rect = self.thumb_list.visualItemRect(item)
+            if not rect.isValid() or not visible_rect.intersects(rect):
+                continue
+
+            entry = self._get_entry_for_item(item)
+            if not entry:
+                continue
+
+            # Skip if already decoded or no VTF
+            if entry.thumbnail is not None:
+                continue
+            if not entry.vtf_path:
+                continue
+
+            if self.thumb_worker:
+                self.thumb_worker.enqueue(entry.id, entry.vtf_path)
+
+    def closeEvent(self, event):
+        # Ensure background threads are stopped
+        if self.scan_thread and self.scan_thread.isRunning():
+            self.scan_thread.requestInterruption()
+            self.scan_thread.wait(1000)
+
+        if self.thumb_worker and self.thumb_worker.isRunning():
+            self.thumb_worker.requestInterruption()
+            self.thumb_worker.wait(1000)
+
+        super().closeEvent(event)
 
     # ---- Item interactions ----
 
