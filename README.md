@@ -13,3 +13,9 @@ Extracted files are written to a folder next to the original archive (same direc
 - `vtf_browser.py`: browse dir&subdirs for `.vmt` files and display thumbnails/metadata
 - - `pip install PyQt5 vtf2img `
 
+
+## MDL
+Very WIP, only really useful for seeing some basic info for now
+- `mdl_browser.py`: browse dir&subdirs for `.mdl` files and display some basic info about them
+
+
